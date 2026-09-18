@@ -19,8 +19,13 @@ import kotlinx.serialization.json.Json
 
 @Serializable
 data class AppSettings(
-    /** The language the downloaded subtitles are in. */
+    /** The language the downloaded subtitles are in, when detection is off. */
     val sourceTag: String = "en",
+    /**
+     * Work out each file's language individually. A mixed archive is the
+     * normal case, not the exception, so this defaults on.
+     */
+    val autoDetectSource: Boolean = true,
     /** The language to translate into. */
     val targetTag: String = "bn",
     /** Only used for the occasional tuning call, never for bulk translation. */
@@ -32,11 +37,27 @@ data class AppSettings(
     /** A ceiling so one bad episode cannot drain the daily AI quota. */
     val maxPolishLines: Int = 60,
     val concurrency: Int = 4,
+    /** Characters per display line after translation; 0 disables re-wrapping. */
+    val wrapWidth: Int = 42,
     val requireWifiForModels: Boolean = false,
     /** Write the source line under each translation, for watching while learning. */
     val bilingual: Boolean = false,
+    /**
+     * Save with the source file's exact name instead of adding a language tag.
+     * Players auto-load a subtitle only when its name matches the video file,
+     * so this is what most people actually want.
+     */
+    val keepOriginalName: Boolean = false,
     /** Drop empty and repeated cues when saving. */
     val tidyOnSave: Boolean = false,
+    /** OpenSubtitles API key, for searching and downloading. */
+    val osApiKey: String = "",
+    /**
+     * Optional OpenSubtitles JWT. A logged-in account has a larger daily
+     * quota; the app never asks for a password, so this is pasted in by hand
+     * if you want it.
+     */
+    val osToken: String = "",
 )
 
 private val Context.dataStore by preferencesDataStore(name = "subtrans")

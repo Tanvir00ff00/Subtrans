@@ -152,6 +152,55 @@ fun SettingsScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         }
 
         item {
+            Column(Modifier.padding(top = 14.dp)) {
+                Text("OpenSubtitles", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "\"খোঁজো\" ট্যাবে সাবটাইটেল খুঁজতে ও নামাতে একটা ফ্রি API key লাগে — " +
+                        "opensubtitles.com-এ অ্যাকাউন্ট খুলে Consumers পাতা থেকে নেওয়া যায়।",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = settings.osApiKey,
+                    onValueChange = { k -> vm.updateSettings { it.copy(osApiKey = k) } },
+                    label = { Text("API key") },
+                    singleLine = true,
+                    visualTransformation = if (showKey) VisualTransformation.None
+                    else PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                )
+                OutlinedTextField(
+                    value = settings.osToken,
+                    onValueChange = { t -> vm.updateSettings { it.copy(osToken = t) } },
+                    label = { Text("টোকেন (ঐচ্ছিক)") },
+                    singleLine = true,
+                    visualTransformation = if (showKey) VisualTransformation.None
+                    else PasswordVisualTransformation(),
+                    supportingText = {
+                        Text(
+                            "লগ-ইন করা অ্যাকাউন্টে দৈনিক সীমা বেশি। অ্যাপ কখনো তোমার পাসওয়ার্ড " +
+                                "চায় না বা রাখে না — টোকেন নিজে নিয়ে এখানে বসাতে পারো।",
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                )
+            }
+        }
+
+        item {
+            Section(
+                "অরিজিনাল নামেই সেভ করো",
+                "নাম অপরিবর্তিত থাকবে — ভিডিও ফাইলের সাথে মিলে গেলে প্লেয়ার নিজেই সাবটাইটেল তুলে নেয়। " +
+                    "বন্ধ থাকলে নামের শেষে ভাষার ট্যাগ বসে, যেমন .bn",
+            ) {
+                Switch(
+                    checked = settings.keepOriginalName,
+                    onCheckedChange = { on -> vm.updateSettings { it.copy(keepOriginalName = on) } },
+                )
+            }
+        }
+
+        item {
             Section(
                 "দ্বিভাষিক ফাইল",
                 "প্রতিটা অনুবাদের নিচে মূল লাইনটাও থাকবে — ভাষা শেখার সময় কাজে দেয়",

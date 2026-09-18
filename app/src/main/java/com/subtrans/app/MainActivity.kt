@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Book
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.FindReplace
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Translate
@@ -35,10 +36,12 @@ import com.subtrans.app.ui.SubTransTheme
 import com.subtrans.app.ui.screens.FileViewerScreen
 import com.subtrans.app.ui.screens.GlossaryScreen
 import com.subtrans.app.ui.screens.RulesScreen
+import com.subtrans.app.ui.screens.SearchScreen
 import com.subtrans.app.ui.screens.SettingsScreen
 import com.subtrans.app.ui.screens.TranslateScreen
 
 private enum class Tab(val label: String, val icon: ImageVector) {
+    Search("খোঁজো", Icons.Default.CloudDownload),
     Translate("অনুবাদ", Icons.Default.Translate),
     Glossary("গ্লসারি", Icons.Default.Book),
     Rules("নিয়ম", Icons.Default.FindReplace),
@@ -98,6 +101,7 @@ private fun AppScaffold(vm: MainViewModel) {
     ) { padding ->
         val inner = Modifier.padding(padding)
         when (tab) {
+            Tab.Search -> SearchScreen(vm, inner)
             Tab.Translate -> TranslateScreen(vm, inner)
             Tab.Glossary -> GlossaryScreen(vm, inner)
             Tab.Rules -> RulesScreen(vm, inner)

@@ -13,9 +13,18 @@ import com.subtrans.app.data.guessSeries
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.subtrans.app.engine.EpisodeTranslator
 import com.subtrans.app.engine.GlossaryEntry
+import com.subtrans.app.engine.LanguageGuard
+import com.subtrans.app.engine.QualityCheck
 import com.subtrans.app.engine.ReplaceRule
+import com.subtrans.app.engine.SourcePlan
 import com.subtrans.app.engine.TranslationEngine
+import com.subtrans.app.net.FolderScan
+import com.subtrans.app.net.OpenSubtitles
+import com.subtrans.app.net.ZipExport
+import com.subtrans.app.net.ZipImport
+import com.subtrans.app.net.bestPerEpisode
 import com.subtrans.app.subtitle.Subtitle
+import com.subtrans.app.subtitle.SubtitleText
 import com.subtrans.app.subtitle.outputName
 import com.subtrans.app.subtitle.parse
 import com.subtrans.app.subtitle.serialize
@@ -34,7 +43,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
-enum class JobStatus { Queued, Running, Done, Error, Stopped }
+enum class JobStatus {
+    Queued, Running, Done, Error, Stopped,
+
+    /** Already in the target language: kept as-is and still exported. */
+    Passthrough,
+}
 
 data class JobUi(
     val id: String,
@@ -47,8 +61,14 @@ data class JobUi(
     /** Of those, how many the AI repaired. */
     val polished: Int = 0,
     val error: String? = null,
+    /** Something worth reading, but the file still translated. */
+    val warning: String? = null,
     /** Bumped on any in-place change, so a viewer knows to re-read the cues. */
     val revision: Int = 0,
+    /** Folder this file came from, relative to what the user picked. */
+    val relativeDir: String = "",
+    /** The language this file was read as, once detected. */
+    val sourceTag: String = "",
 ) {
     val progress: Float get() = if (total == 0) 0f else done.toFloat() / total
 }
@@ -70,10 +90,32 @@ data class RunStats(
     val flagged: Int,
     val polished: Int,
     val seconds: Long,
+    /** Files already in the target language, copied through untouched. */
+    val passedThrough: Int = 0,
+    /** Which source languages the batch turned out to contain. */
+    val languages: List<String> = emptyList(),
 ) {
     /** Share of lines the offline engine handled without help. */
     val offlineShare: Double get() = if (lines == 0) 1.0 else 1.0 - flagged.toDouble() / lines
 }
+
+/** One episode as offered by a subtitle source, already narrowed to the best upload. */
+data class EpisodeOption(val episode: Int, val entry: OpenSubtitles.Entry)
+
+/** Everything the search tab is currently showing. */
+data class SearchState(
+    val query: String = "",
+    /** A short message while a request is in flight, or null when idle. */
+    val busy: String? = null,
+    val shows: List<OpenSubtitles.Show> = emptyList(),
+    val show: OpenSubtitles.Show? = null,
+    val season: Int = 1,
+    val episodes: List<EpisodeOption> = emptyList(),
+    val selected: Set<Int> = emptySet(),
+    /** Downloads left today, when the server tells us. */
+    val remaining: Int? = null,
+    val error: String? = null,
+)
 
 enum class ModelState { Unknown, Missing, Downloading, Ready, Unsupported }
 
@@ -108,6 +150,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Parsed subtitles, kept out of UI state because they are large and mutable. */
     private val parsed = mutableMapOf<String, Subtitle>()
 
+    /**
+     * Fingerprints of what is already queued. Subtitle packs routinely carry
+     * the same file under two names, and translating it twice wastes a run.
+     */
+    private val contentFingerprints = mutableMapOf<String, String>()
+
     /** Which cues the offline pass was unsure about, so the viewer can mark them. */
     private val flaggedIds = mutableMapOf<String, Set<Int>>()
 
@@ -139,8 +187,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val id = uri.toString()
                 if (parsed.containsKey(id)) continue
                 try {
+                    // Not assumed to be UTF-8: a UTF-16 or Windows-1252 file
+                    // decoded as UTF-8 still parses, and is ruined by then.
                     val text = resolver.openInputStream(uri)?.use { stream ->
-                        stream.readBytes().toString(Charsets.UTF_8)
+                        SubtitleText.decode(stream.readBytes()).text
                     } ?: continue
 
                     val sub = parse(name, text)
@@ -148,6 +198,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         added += JobUi(id, name, JobStatus.Error, error = "কোনো সংলাপ পাওয়া যায়নি")
                         continue
                     }
+                    val fingerprint = fingerprintOf(sub)
+                    if (contentFingerprints.containsKey(fingerprint)) {
+                        added += JobUi(
+                            id, name, JobStatus.Error,
+                            error = "এই লেখাটা তালিকায় আগেই আছে, অন্য নামে — দুবার অনুবাদ করার দরকার নেই।",
+                        )
+                        continue
+                    }
+                    contentFingerprints[fingerprint] = id
                     parsed[id] = sub
                     added += JobUi(id, name, JobStatus.Queued, total = sub.cues.size)
                 } catch (e: Exception) {
@@ -169,6 +228,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (_running.value) return
         parsed.clear()
         flaggedIds.clear()
+        contentFingerprints.clear()
         _openJobId.value = null
         _jobs.value = emptyList()
     }
@@ -200,6 +260,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
     }
+
+    /**
+     * Identifies a subtitle by its content rather than its name, so the same
+     * episode arriving twice under different names is caught.
+     */
+    private fun fingerprintOf(sub: Subtitle): String =
+        "${sub.cues.size}:${sub.cues.joinToString("") { it.text }.hashCode()}"
 
     private fun displayName(uri: Uri): String? {
         val resolver = getApplication<Application>().contentResolver
@@ -256,77 +323,186 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _running.value = true
             _notice.value = null
             val s = settings.value
-
-            val engine = TranslationEngine.create(s.sourceTag, s.targetTag)
-            if (engine == null) {
-                _notice.value = "এই ভাষা জোড়াটা ML Kit সাপোর্ট করে না।"
-                _modelState.value = ModelState.Unsupported
-                _running.value = false
-                return@launch
-            }
+            val startedAt = System.currentTimeMillis()
 
             try {
-                _busyNote.value = "ভাষার মডেল প্রস্তুত করছি…"
-                engine.ensureModel(s.requireWifiForModels)
-                _modelState.value = ModelState.Ready
+                // Phase one: work out what each file actually is. A dropped
+                // archive is rarely uniform — some English, some Hindi, and a
+                // few already translated from an earlier run.
+                val byLanguage = linkedMapOf<String, MutableList<JobUi>>()
+                var passedThrough = 0
+                var refused = 0
+
+                for ((index, item) in queue.withIndex()) {
+                    if (!_running.value) break
+                    val sub = parsed[item.id] ?: continue
+                    _busyNote.value = "ভাষা দেখছি ${index + 1}/${queue.size}…"
+
+                    val lines = sub.cues.map { it.text }
+                    val script = LanguageGuard.dominantScriptOfFile(lines)
+                    val detected = if (s.autoDetectSource) detectTag(lines) else null
+
+                    val decision = SourcePlan.decide(
+                        detected = detected,
+                        script = script,
+                        configured = s.sourceTag,
+                        target = s.targetTag,
+                        supports = TranslationEngine::supports,
+                    )
+
+                    when (decision) {
+                        // Already done. It still belongs in the output: leaving
+                        // it out would hand back ninety-five files for a hundred
+                        // given, and the missing ones would be the finished ones.
+                        is SourcePlan.Decision.PassThrough -> {
+                            passedThrough++
+                            patch(item.id) {
+                                it.copy(
+                                    status = JobStatus.Passthrough,
+                                    done = it.total,
+                                    sourceTag = s.targetTag,
+                                    warning = "আগে থেকেই ${languageName(s.targetTag)}-তে — " +
+                                        "অপরিবর্তিত রেখে আউটপুটে রাখা হয়েছে।",
+                                )
+                            }
+                        }
+
+                        is SourcePlan.Decision.Unsupported -> {
+                            refused++
+                            patch(item.id) {
+                                it.copy(
+                                    status = JobStatus.Error,
+                                    error = decision.sourceTag
+                                        ?.let { t -> "${languageName(t)} থেকে অনুবাদের মডেল নেই।" }
+                                        ?: "ফাইলটা কোন ভাষায় বোঝা গেল না।",
+                                )
+                            }
+                        }
+
+                        is SourcePlan.Decision.Translate -> {
+                            patch(item.id) {
+                                it.copy(
+                                    sourceTag = decision.sourceTag,
+                                    warning = if (decision.confident) null else
+                                        "ভাষা নিশ্চিত হওয়া গেল না — সেটিংসের " +
+                                            "${languageName(decision.sourceTag)} ধরে নেওয়া হলো।",
+                                )
+                            }
+                            byLanguage.getOrPut(decision.sourceTag) { mutableListOf() } += item
+                        }
+                    }
+                }
                 _busyNote.value = null
 
-                val startedAt = System.currentTimeMillis()
+                // Phase two: one model per language rather than per file.
                 var statLines = 0
                 var statFlagged = 0
                 var statPolished = 0
                 var statFiles = 0
 
                 val glossary = activeGlossary
-                val translator = EpisodeTranslator(engine, glossary, rules.value, s.concurrency)
                 val tuner = if (s.aiPolish && s.geminiKey.isNotBlank()) {
                     AiTuner(s.geminiKey, s.geminiModel)
                 } else null
 
-                for (item in queue) {
+                for ((sourceTag, group) in byLanguage) {
                     if (!_running.value) break
-                    val sub = parsed[item.id] ?: continue
-                    patch(item.id) { it.copy(status = JobStatus.Running, done = 0, polished = 0) }
+                    val engine = TranslationEngine.create(sourceTag, s.targetTag) ?: continue
 
-                    val report = translator.translate(sub) { done, total ->
-                        patch(item.id) { it.copy(done = done, total = total) }
+                    try {
+                        _busyNote.value =
+                            "${languageName(sourceTag)} → ${languageName(s.targetTag)} মডেল প্রস্তুত করছি…"
+                        engine.ensureModel(s.requireWifiForModels)
+                        _modelState.value = ModelState.Ready
+                        _busyNote.value = null
+
+                        val translator = EpisodeTranslator(
+                            engine, glossary, rules.value, s.concurrency, wrapWidth = s.wrapWidth,
+                        )
+
+                        for (item in group) {
+                            if (!_running.value) break
+                            val sub = parsed[item.id] ?: continue
+                            patch(item.id) {
+                                it.copy(status = JobStatus.Running, done = 0, polished = 0)
+                            }
+
+                            val report = translator.translate(sub) { done, total ->
+                                patch(item.id) { it.copy(done = done, total = total) }
+                            }
+                            flaggedIds[item.id] = report.flagged.mapTo(mutableSetOf()) { it.cueId }
+                            patch(item.id) { it.copy(flagged = report.flagged.size) }
+
+                            var polished = 0
+                            if (tuner != null && report.flagged.isNotEmpty()) {
+                                polished = polish(translator, tuner, sub, report, s)
+                            }
+
+                            val untouched = report.flagCounts[QualityCheck.Flag.UNCHANGED] ?: 0
+                            val untouchedShare =
+                                if (report.total == 0) 0.0 else untouched.toDouble() / report.total
+
+                            patch(item.id) {
+                                it.copy(
+                                    status = JobStatus.Done,
+                                    done = it.total,
+                                    polished = polished,
+                                    warning = if (untouchedShare > 0.4) {
+                                        "বেশিরভাগ লাইন অপরিবর্তিত ফিরেছে — ভাষার জোড়া দেখে নাও।"
+                                    } else null,
+                                )
+                            }
+
+                            statFiles++
+                            statLines += report.total
+                            statFlagged += report.flagged.size
+                            statPolished += polished
+                        }
+                    } finally {
+                        engine.close()
                     }
-                    flaggedIds[item.id] = report.flagged.mapTo(mutableSetOf()) { it.cueId }
-                    patch(item.id) { it.copy(flagged = report.flagged.size) }
-
-                    var polished = 0
-                    if (tuner != null && report.flagged.isNotEmpty()) {
-                        patch(item.id) { it.copy(status = JobStatus.Running) }
-                        polished = polish(translator, tuner, sub, report, s)
-                    }
-
-                    patch(item.id) {
-                        it.copy(status = JobStatus.Done, done = it.total, polished = polished)
-                    }
-
-                    statFiles++
-                    statLines += report.total
-                    statFlagged += report.flagged.size
-                    statPolished += polished
                 }
 
-                if (statFiles > 0) {
+                if (statFiles > 0 || passedThrough > 0) {
                     _lastStats.value = RunStats(
                         files = statFiles,
                         lines = statLines,
                         flagged = statFlagged,
                         polished = statPolished,
                         seconds = (System.currentTimeMillis() - startedAt) / 1000,
+                        passedThrough = passedThrough,
+                        languages = byLanguage.keys.toList(),
                     )
+                }
+
+                // Every file is accounted for out loud, so a missing one is
+                // never discovered later by counting the output.
+                _notice.value = buildString {
+                    append("$statFiles টি অনুবাদ হয়েছে")
+                    if (passedThrough > 0) append(", $passedThrough টি আগে থেকেই ${languageName(s.targetTag)}-তে ছিল")
+                    if (refused > 0) append(", $refused টি পারা যায়নি")
+                    append("। মোট ${queue.size} টির মধ্যে ${statFiles + passedThrough} টি সেভ করার জন্য প্রস্তুত।")
                 }
             } catch (e: Exception) {
                 _notice.value = e.message ?: "অনুবাদ চলাকালীন সমস্যা হয়েছে"
             } finally {
-                engine.close()
                 _busyNote.value = null
                 _running.value = false
             }
         }
+    }
+
+    /**
+     * Asks ML Kit what language a file is in. Returns null when it has no
+     * confident opinion, which the caller treats as "fall back to the script
+     * and then to the configured source" rather than as a failure.
+     */
+    private suspend fun detectTag(lines: List<String>): String? {
+        val sample = lines.take(120).joinToString(" ").take(3000)
+        if (sample.isBlank()) return null
+        return runCatching {
+            LanguageIdentification.getClient().use { it.identifyLanguage(sample).await() }
+        }.getOrNull()?.takeIf { it != "und" }
     }
 
     /** Sends only the flagged lines to the AI, capped so a quota cannot vanish. */
@@ -405,7 +581,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /* ------------------------------------------------------------ export */
 
     fun exportAll(treeUri: Uri) = viewModelScope.launch {
-        val done = _jobs.value.filter { it.status == JobStatus.Done }
+        val done = _jobs.value.filter { it.status in EXPORTABLE }
         if (done.isEmpty()) {
             _notice.value = "এখনো কোনো ফাইল অনুবাদ হয়নি।"
             return@launch
@@ -413,7 +589,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         _busyNote.value = "ফাইল সেভ করছি…"
         val context = getApplication<Application>()
-        val tag = settings.value.targetTag
         var written = 0
 
         withContext(Dispatchers.IO) {
@@ -424,7 +599,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             for (item in done) {
                 val text = renderFile(item.id) ?: continue
-                val name = outputName(item.fileName, tag)
+                val name = outputNameFor(item.fileName)
                 dir.findFile(name)?.delete()
                 val file = dir.createFile("application/x-subrip", name) ?: continue
                 context.contentResolver.openOutputStream(file.uri)?.use { out ->
@@ -438,12 +613,298 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _notice.value = if (written > 0) "$written টি ফাইল সেভ হয়েছে।" else "কিছু সেভ করা গেল না।"
     }
 
+    /* ------------------------------------------------- subtitle sources */
+
+    private val _search = MutableStateFlow(SearchState())
+    val search: StateFlow<SearchState> = _search.asStateFlow()
+
+    private fun openSubtitles(): OpenSubtitles? {
+        val s = settings.value
+        if (s.osApiKey.isBlank()) {
+            _search.value = _search.value.copy(
+                error = "সেটিংসে OpenSubtitles API key বসাও — ফ্রি অ্যাকাউন্টে পাওয়া যায়।",
+            )
+            return null
+        }
+        return OpenSubtitles(s.osApiKey, s.osToken)
+    }
+
+    fun setSearchQuery(q: String) { _search.value = _search.value.copy(query = q, error = null) }
+
+    fun searchShows() = viewModelScope.launch {
+        val client = openSubtitles() ?: return@launch
+        val query = _search.value.query.trim()
+        if (query.isBlank()) return@launch
+
+        _search.value = _search.value.copy(busy = "সিরিজ খুঁজছি…", error = null, shows = emptyList())
+        try {
+            val shows = client.searchShows(query)
+            _search.value = _search.value.copy(
+                busy = null,
+                shows = shows,
+                show = null,
+                episodes = emptyList(),
+                selected = emptySet(),
+                error = if (shows.isEmpty()) "\"$query\" নামে কিছু পাওয়া গেল না।" else null,
+            )
+        } catch (e: Exception) {
+            _search.value = _search.value.copy(busy = null, error = e.message)
+        }
+    }
+
+    fun pickShow(show: OpenSubtitles.Show) {
+        _search.value = _search.value.copy(show = show, episodes = emptyList(), selected = emptySet())
+        if (_series.value.isBlank()) _series.value = show.title
+        loadEpisodes()
+    }
+
+    fun setSeason(season: Int) {
+        _search.value = _search.value.copy(season = season)
+        loadEpisodes()
+    }
+
+    fun backToShows() {
+        _search.value = _search.value.copy(show = null, episodes = emptyList(), selected = emptySet())
+    }
+
+    fun loadEpisodes() = viewModelScope.launch {
+        val client = openSubtitles() ?: return@launch
+        val state = _search.value
+        val show = state.show ?: return@launch
+
+        _search.value = state.copy(busy = "এপিসোড তালিকা আনছি…", error = null)
+        try {
+            val entries = client.listSeason(
+                featureId = show.featureId,
+                season = state.season,
+                language = settings.value.sourceTag,
+            ) { page, total ->
+                _search.value = _search.value.copy(busy = "এপিসোড তালিকা আনছি… ($page/$total)")
+            }
+
+            // Many uploads exist per episode; only the best one is worth showing.
+            val best = bestPerEpisode(entries)
+            val options = best.entries.sortedBy { it.key }
+                .map { EpisodeOption(it.key, it.value) }
+
+            _search.value = _search.value.copy(
+                busy = null,
+                episodes = options,
+                selected = emptySet(),
+                remaining = client.remainingDownloads(),
+                error = if (options.isEmpty()) {
+                    "সিজন ${state.season}-এ ${languageName(settings.value.sourceTag)} সাবটাইটেল পাওয়া গেল না।"
+                } else null,
+            )
+        } catch (e: Exception) {
+            _search.value = _search.value.copy(busy = null, error = e.message)
+        }
+    }
+
+    fun toggleEpisode(episode: Int) {
+        val current = _search.value.selected
+        _search.value = _search.value.copy(
+            selected = if (episode in current) current - episode else current + episode,
+        )
+    }
+
+    fun selectAllEpisodes() {
+        _search.value = _search.value.copy(
+            selected = _search.value.episodes.map { it.episode }.toSet(),
+        )
+    }
+
+    fun clearEpisodeSelection() { _search.value = _search.value.copy(selected = emptySet()) }
+
+    /**
+     * Downloads the chosen episodes into the translation queue.
+     *
+     * Each one spends a download from the daily quota, so the run stops the
+     * moment the server says the quota is gone and reports how far it got —
+     * rather than hammering a limit that will not move until tomorrow.
+     */
+    fun downloadSelected() = viewModelScope.launch {
+        val client = openSubtitles() ?: return@launch
+        val state = _search.value
+        val chosen = state.episodes.filter { it.episode in state.selected }
+        if (chosen.isEmpty()) return@launch
+
+        var done = 0
+        var stoppedBy: String? = null
+        var remaining = state.remaining
+
+        for ((index, option) in chosen.withIndex()) {
+            _search.value = _search.value.copy(
+                busy = "নামাচ্ছি ${index + 1}/${chosen.size}…",
+                error = null,
+            )
+            try {
+                val ticket = client.requestDownload(option.entry.fileId)
+                remaining = ticket.remaining
+                val text = client.fetchText(ticket.link)
+                addContent(ticket.fileName, text)
+                done++
+            } catch (e: OpenSubtitles.ApiException) {
+                stoppedBy = e.message
+                if (e.quotaExhausted || e.status == 403 || e.status == 401) break
+            } catch (e: Exception) {
+                stoppedBy = e.message
+            }
+        }
+
+        _search.value = _search.value.copy(busy = null, remaining = remaining, error = stoppedBy)
+        _notice.value = buildString {
+            append("$done টি সাবটাইটেল অনুবাদের তালিকায় যোগ হয়েছে।")
+            if (remaining != null) append(" আজ আর $remaining টি নামানো যাবে।")
+            if (done < chosen.size && stoppedBy != null) append(" বাকিগুলো হয়নি: $stoppedBy")
+        }
+    }
+
+    /**
+     * Imports a subtitle pack. One archive can hold a whole season, which is
+     * the only way to get three hundred episodes without three hundred
+     * downloads counting against the daily limit.
+     */
+    fun importZip(uri: Uri) = viewModelScope.launch {
+        _busyNote.value = "আর্কাইভ খুলছি…"
+        try {
+            val result = withContext(Dispatchers.IO) {
+                getApplication<Application>().contentResolver.openInputStream(uri)?.use {
+                    ZipImport.extract(it)
+                }
+            }
+            _busyNote.value = null
+
+            if (result == null || result.files.isEmpty()) {
+                _notice.value = "আর্কাইভে কোনো সাবটাইটেল ফাইল পাওয়া গেল না।"
+                return@launch
+            }
+            for (file in result.files) addContent(file.fileName, file.text)
+            _notice.value = "${result.files.size} টি ফাইল যোগ হয়েছে" +
+                if (result.skipped > 0) ", ${result.skipped} টি বাদ পড়েছে।" else "।"
+        } catch (e: Exception) {
+            _busyNote.value = null
+            _notice.value = "আর্কাইভটা পড়া গেল না: ${e.message ?: "অজানা সমস্যা"}"
+        }
+    }
+
+    /**
+     * Adds every subtitle in a picked folder, however deeply nested.
+     *
+     * Each file remembers where it sat relative to the folder, so a ZIP export
+     * can hand the same tree back rather than a flat heap of files.
+     */
+    fun importFolder(treeUri: Uri) = viewModelScope.launch {
+        _busyNote.value = "ফোল্ডার ঘুরে দেখছি…"
+        try {
+            val context = getApplication<Application>()
+            val files = FolderScan.scan(context, treeUri)
+            if (files.isEmpty()) {
+                _notice.value = "ওই ফোল্ডারে কোনো সাবটাইটেল ফাইল পাওয়া গেল না।"
+                return@launch
+            }
+
+            var added = 0
+            withContext(Dispatchers.IO) {
+                for ((index, file) in files.withIndex()) {
+                    _busyNote.value = "পড়ছি ${index + 1}/${files.size}…"
+                    val bytes = runCatching {
+                        context.contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
+                    }.getOrNull() ?: continue
+
+                    val text = SubtitleText.decode(bytes).text
+                    if (addContent(file.name, text, file.relativeDir, id = file.uri.toString())) {
+                        added++
+                    }
+                }
+            }
+            _notice.value = "$added টি ফাইল যোগ হয়েছে (${files.size} টির মধ্যে)।"
+        } catch (e: Exception) {
+            _notice.value = "ফোল্ডারটা পড়া গেল না: ${e.message ?: "অজানা সমস্যা"}"
+        } finally {
+            _busyNote.value = null
+        }
+    }
+
+    /** Writes every finished file into one archive, folder structure intact. */
+    fun exportZip(target: Uri) = viewModelScope.launch {
+        val done = _jobs.value.filter { it.status in EXPORTABLE }
+        if (done.isEmpty()) {
+            _notice.value = "এখনো সেভ করার মতো কোনো ফাইল নেই।"
+            return@launch
+        }
+
+        _busyNote.value = "আর্কাইভ বানাচ্ছি…"
+        try {
+            val entries = done.mapNotNull { job ->
+                val text = renderFile(job.id) ?: return@mapNotNull null
+                val name = outputNameFor(job.fileName)
+                val path = if (job.relativeDir.isEmpty()) name else "${job.relativeDir}/$name"
+                ZipExport.Entry(path, text)
+            }
+
+            val written = withContext(Dispatchers.IO) {
+                getApplication<Application>().contentResolver.openOutputStream(target)?.use { out ->
+                    ZipExport.write(out, entries)
+                } ?: 0
+            }
+            _notice.value = if (written > 0) "$written টি ফাইল ZIP-এ সেভ হয়েছে।"
+            else "আর্কাইভে কিছু লেখা গেল না।"
+        } catch (e: Exception) {
+            _notice.value = "ZIP বানানো গেল না: ${e.message ?: "অজানা সমস্যা"}"
+        } finally {
+            _busyNote.value = null
+        }
+    }
+
+    fun suggestedZipName(): String {
+        val stem = (_series.value.ifBlank { "subtitles" }).replace(Regex("""[\\/:*?"<>|]"""), "")
+        return "$stem.${settings.value.targetTag}.zip"
+    }
+
+    /** Puts subtitle text that came from anywhere but a file picker into the queue. */
+    private fun addContent(fileName: String, text: String) {
+        addContent(fileName, text, "", "content:$fileName:${text.length}")
+    }
+
+    private fun addContent(
+        fileName: String,
+        text: String,
+        relativeDir: String,
+        id: String,
+    ): Boolean {
+        if (parsed.containsKey(id)) return false
+
+        val sub = runCatching { parse(fileName, text) }.getOrNull()
+        if (sub == null || sub.cues.isEmpty()) {
+            _jobs.value += JobUi(id, fileName, JobStatus.Error, error = "পড়া গেল না")
+            return false
+        }
+
+        // Packs routinely carry the same episode twice under different names.
+        val fingerprint = fingerprintOf(sub)
+        if (contentFingerprints.containsKey(fingerprint)) return false
+        contentFingerprints[fingerprint] = id
+
+        parsed[id] = sub
+        _jobs.value += JobUi(
+            id = id,
+            fileName = fileName,
+            status = JobStatus.Queued,
+            total = sub.cues.size,
+            relativeDir = relativeDir,
+        )
+        if (_series.value.isBlank()) _series.value = guessSeries(fileName)
+        return true
+    }
+
     /* ------------------------------------------------------ file actions */
 
     fun removeJob(id: String) {
         if (_running.value) return
         parsed.remove(id)
         flaggedIds.remove(id)
+        contentFingerprints.entries.removeIf { it.value == id }
         if (_openJobId.value == id) _openJobId.value = null
         _jobs.value = _jobs.value.filterNot { it.id == id }
     }
@@ -512,8 +973,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun suggestedFileName(id: String): String {
         val job = _jobs.value.firstOrNull { it.id == id } ?: return "subtitle.srt"
-        return outputName(job.fileName, settings.value.targetTag)
+        return outputNameFor(job.fileName)
     }
+
+    /**
+     * What a saved file should be called. Keeping the original name is what
+     * makes a player pick the subtitle up automatically, because it only does
+     * so when the names match the video file exactly.
+     */
+    private fun outputNameFor(fileName: String): String =
+        if (settings.value.keepOriginalName) fileName
+        else outputName(fileName, settings.value.targetTag)
 
     /**
      * Asks ML Kit which language a file is actually in. Subtitle packs are
@@ -575,6 +1045,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         refreshDownloadedModels()
         refreshModelState()
     }
+
+    /**
+     * Which files belong in an export. A passthrough file was already in the
+     * target language and was never translated — but it is still one of the
+     * files the user handed in, so it goes to the output unchanged.
+     */
+    private val EXPORTABLE = setOf(JobStatus.Done, JobStatus.Passthrough)
 
     /** Bumps the job so a viewer watching it rebuilds its snapshot. */
     private fun touch(id: String) = patch(id) { it.copy(revision = it.revision + 1) }
