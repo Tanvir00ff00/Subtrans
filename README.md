@@ -1,142 +1,237 @@
 # SubTrans
 
-সাবটাইটেল ফাইল নিজের ভাষায় অনুবাদ করার অ্যান্ড্রয়েড অ্যাপ। অনুবাদ হয় ফোনেই, অফলাইনে,
-কোনো দৈনিক সীমা ছাড়া। AI ডাকা হয় শুধু সেই অল্প কিছু লাইনের জন্য যেগুলো ইঞ্জিন ঠিকমতো
-পারেনি — পুরো সিরিজে বিশ-ত্রিশবার, প্রতি লাইনে নয়।
+An Android app that translates subtitle files into your own language. Translation
+runs on the phone, offline, with no daily limit. AI is called only for the handful
+of lines the engine is unsure about — twenty or thirty times across a whole series,
+not once per line.
 
-## কেন এভাবে
+No account, no API key, nothing to sign up for.
 
-একটা এপিসোডে প্রায় ৩০০ লাইন সংলাপ। ২৯৩ এপিসোডের একটা সিরিজ মানে প্রায় ৯০ হাজার লাইন।
-প্রতিটা লাইনের জন্য AI ডাকলে কোনো ফ্রি কোটাই টিকবে না, আর সময় লাগবে ঘণ্টার পর ঘণ্টা।
+## Why it is built this way
 
-তাই কাজটা ভাগ করা। **ML Kit-এর অন-ডিভাইস মডেল** সব লাইন অনুবাদ করে — একবার ভাষার মডেল
-নামালে (৩০-৪০ MB) তারপর ইন্টারনেট ছাড়াই, বিনামূল্যে, আনলিমিটেড। **AI শুধু টিউন করে**:
-একবার গ্লসারি বানায়, আর যে লাইনগুলো নিয়ে ইঞ্জিন সন্দিহান সেগুলো ঠিক করে।
+An episode carries around 300 lines of dialogue. A 293-episode series is roughly
+90,000 lines. Sending each one to an AI would exhaust any free quota long before
+the first season finished, and would take hours.
 
-## যেসব ভুল কোড দিয়ে বন্ধ করা
+So the work is split. **ML Kit's on-device models** translate every line — once the
+language pair is downloaded (30–40 MB, one time) it runs with no network, free, and
+without limit. **AI only tunes**: it builds a glossary once, and repairs the lines
+the engine flags.
 
-এই প্রকল্পের বেশিরভাগ কোড আসলে *নীরব ব্যর্থতা* ঠেকানোর জন্য — যেসব ভুল কোথাও এরর দেখায়
-না, শুধু ফল নষ্ট করে।
+## Failures this code exists to prevent
 
-**টাইমিং স্লিপ।** টাইমস্ট্যাম্প কখনো অনুবাদকের কাছে যায় না। প্রতিটা লাইন নিজের জায়গায়
-ফিরে বসে, তাই অনুবাদ যেমনই হোক সময় এলোমেলো হয় না।
+Most of this project is defensive. The bugs that matter in subtitle translation are
+the silent ones — nothing errors, the file still parses, the line count is still
+right, and the result is quietly ruined.
 
-**নাম বিকৃতি।** চরিত্রের নাম আর বিশেষ শব্দ অনুবাদের *আগেই* প্লেসহোল্ডার দিয়ে ঢেকে দেওয়া
-হয়, পরে গ্লসারি থেকে ঠিক বানানটা বসে। সব এপিসোডে নাম একরকম থাকে।
+**Timing drift.** Timestamps never reach the translator. Every line is re-seated by
+id, so no matter what the model does to the words, the timing cannot shift.
 
-**আগে-অনুবাদ-করা ফাইল আবার অনুবাদ করা।** এটা সত্যিই ঘটেছিল: একটা ফাইলের নাম ছিল
-`..._English.srt`, ভেতরে ছিল ঝরঝরে বাংলা। ইংরেজি ভেবে আবার অনুবাদ করায় লেখা ভেঙে গিয়েছিল।
-এখন ফাইলের **লিপি** দেখে বিচার হয়, নাম দেখে নয় — আর এমন ফাইল ছোঁয়াই হয় না।
+**Mangled names.** Character names and special terms are locked before translation
+and written back with the agreed spelling afterwards, so they stay identical across
+every episode.
 
-**নীরবে ফাইল হারানো।** আগে-অনুবাদ-করা ফাইল বাদ দিলে ১০০টার বদলে ৯৫টা ফেরত যেত, আর
-হারানো পাঁচটা হত ঠিক সেগুলো যেগুলো আগেই শেষ। এখন ওগুলো **অপরিবর্তিত অবস্থায় আউটপুটে
-যায়**, আর রান শেষে পুরো হিসাব দেখানো হয়।
+**Re-translating finished work.** This really happened: a file named `..._English.srt`
+contained perfectly good Bengali. Treated as English, it was translated again and
+destroyed. Judgement is now made on the file's **script**, not its name, and such a
+file is passed through untouched.
 
-**এনকোডিং।** UTF-16 বা Windows-1252 ফাইল UTF-8 ধরে পড়লে সেটা পার্সও হয়, লাইনও গোনে —
-শুধু লেখাটা আবর্জনা হয়। এখন বাইট দেখে এনকোডিং বের করা হয়।
+**Losing files silently.** Already-translated files used to be excluded from export,
+so 100 files in gave 95 out — and the missing five were exactly the finished ones.
+They are now exported unchanged, and every run reports a full count out loud.
 
-**ICU বনাম JVM রেগেক্স।** অ্যান্ড্রয়েড ICU দিয়ে রেগেক্স কম্পাইল করে, ডেস্কটপের JVM আলাদা
-ইঞ্জিন দিয়ে। একটা escape না করা `}` ল্যাপটপে সব টেস্ট পাস করে ফোনে ক্র্যাশ করেছিল।
-`RegexCompilesOnDeviceTest` এখন সেটাই পাহারা দেয়।
+**Encoding.** A UTF-16 or Windows-1252 file read as UTF-8 parses fine and counts
+lines fine; only the text is garbage. Encoding is now detected from the bytes.
 
-## ফিচার
+**ICU vs JVM regex.** Android compiles regexes with ICU, the desktop JVM does not.
+One unescaped `}` passed every unit test on a laptop and crashed on a phone.
+`RegexCompilesOnDeviceTest` guards that whole class of bug.
 
-**আমদানি** — আলাদা ফাইল, গোটা ফোল্ডার (ভেতরের ফোল্ডারসহ, আট স্তর গভীর পর্যন্ত), বা ZIP
-সিজন প্যাক। OpenSubtitles থেকে সিরিজের নাম লিখে সরাসরি খুঁজে নামানোও যায়।
+**Markup destroying the translation.** See below — this one was measured, and it was
+the worst of them.
 
-**মিশ্র ভাষা** — এক ব্যাচে কিছু ইংরেজি, কিছু হিন্দি থাকলেও চলে। প্রতিটা ফাইলের ভাষা
-আলাদা করে শনাক্ত হয়, আর প্রতি ভাষায় মডেল একবারই লোড হয়।
+## The placeholder bug
 
-**পড়া ও সম্পাদনা** — যেকোনো ফাইল খুলে মূল ও অনুবাদ পাশাপাশি দেখা যায়, খোঁজা যায়,
-সন্দেহজনক লাইন আলাদা করে দেখা যায়, আর যেকোনো লাইন হাতে ঠিক করা যায়।
+The first design swapped every styling tag for a short token: `<i>` became `@0@`, on
+the theory that a translation model ignores meaningless ASCII. Seven real episodes
+disproved that in three separate ways:
 
-**সরঞ্জাম** — টাইমিং ±সেকেন্ডে সরানো (ভিন্ন রিলিজের জন্য কাটা সাবটাইটেল উদ্ধারের জন্য),
-খালি ও পুনরাবৃত্ত লাইন বাদ দেওয়া, ভাষা শনাক্তকরণ, আর খুঁজে-বদলে দেওয়ার নিয়ম।
+1. ML Kit pads the token with spaces. `@0@` returns as `@ 0 @`, the restore pattern
+   no longer matches, and the junk is written into the subtitle.
+2. Sometimes the token stops the model translating at all — the English is echoed
+   straight back, landing an untranslated line in the output file.
+3. Sometimes the model degenerates into a row of bare `@`, losing the sentence.
 
-**রপ্তানি** — আলাদা ফাইল, গোটা ফোল্ডার, বা ZIP — ইনপুটের ফোল্ডার কাঠামো অক্ষত রেখে।
-নাম অপরিবর্তিত রাখা যায় যাতে প্লেয়ার নিজে থেকেই সাবটাইটেল তুলে নেয়, বা দ্বিভাষিক ফাইল
-বানানো যায় যেখানে প্রতিটা অনুবাদের নিচে মূল লাইন থাকে।
+The share of broken lines tracked the share of italic lines almost exactly:
 
-সাপোর্টেড ফরম্যাট: `.srt` · `.vtt` · `.ass` / `.ssa`। ASS ফাইলে শুধু সংলাপের টেক্সট
-বদলায় — স্টাইল, ফন্ট, পজিশন সব অপরিবর্তিত থাকে।
+| Episode | Italic lines | Broken lines |
+|---|---|---|
+| E269 | 1 | 1 |
+| **E270** | **160 of 299** | **111** |
+| E271 | 11 | 15 |
+| E272 | 14 | 16 |
+| E273 | 11 | 13 |
+| E275 | 3 | 3 |
 
-## গতি
+**The fix:** markup is no longer encoded for the model — it never reaches the model.
+A line is cut into literal markup and translatable text, only the words are sent, and
+the pieces are reassembled afterwards. There is nothing left to mangle.
 
-৭ এপিসোডের একটা আসল ব্যাচে (২,৯০০ লাইন) মেপে দেখা:
+Swept across all 2,474 cues of those seven files: **0 tags leaked, 0 lines broken,
+and exactly 1.000 chunks per cue** — so the guarantee costs no extra model calls at
+all. A sentence split across two italic display lines now reaches the model whole
+rather than in halves, which also reads better.
 
-| পদ্ধতি | মডেল কল |
+## The phrase table
+
+Some failures are the model's, not the plumbing's. A general translation model does
+not know it is reading dialogue, so it gives a one-word line its commonest prose
+meaning. Measured on the same episodes:
+
+| Line | What the model returned |
 |---|---|
-| প্রতি লাইনে একটা | ২,৯০০ |
-| ব্যাচিং | ৯৪৯ |
-| ব্যাচিং + লাইন জোড়া | **২৯৭** |
+| `Fine.` | জরিমানা — a monetary fine |
+| `I'm fine.` | আমি জরিমানা করছি — "I am issuing a fine" |
+| `Bye-bye!` | ঘুম! — sleep |
+| `Huh?` | তাই না? — "isn't it?", the opposite of a question |
+| `Damn it!` | এটা! — "this!" |
 
-তিনটে জিনিস কাজে লাগে। অক্ষরবিহীন লাইন (`♪`, `...`) অনুবাদেই যায় না। অভিন্ন লাইন একবারই
-অনুবাদ হয়। আর কয়েকটা লাইন একসাথে এক কলে যায় — **লাইন সংখ্যা হুবহু না মিললে ব্যাচটা
-গ্রহণই করা হয় না**, তখন আলাদা করে আবার পাঠানো হয়। ধীর কিন্তু সঠিক উত্তর ভুল উত্তরের চেয়ে
-ভালো।
+These are frequent — across six episodes `Huh?` appeared 17 times and `No way` 22 —
+and easy to get right, because they are whole lines with one obvious spoken meaning.
+So they are answered from a table instead of the model, which is both more accurate
+and one fewer call.
 
-সাবটাইটেলে দুই লাইনে ভাঙাটা প্রদর্শনের ব্যাপার, অর্থের নয় — তাই অনুবাদের আগে জোড়া দেওয়া
-হয়। এতে কল কমে, আর মডেল খণ্ডিত বাক্যের বদলে পুরো বাক্য দেখতে পায়।
+The table is deliberately narrow: it matches **whole lines only**, so `Fine.` is
+answered but `Fine, let's go` is left to the model. A glossary entry or replace rule
+overrides it. It is a seed to be corrected, not an authority.
 
-## বানাতে হলে
+## Where subtitles come from
+
+Three routes, cheapest first. **None of them requires an API key except the last.**
+
+**ZIP or folder import.** No key, no limit, nested folders up to eight deep. For a
+long series this is the only practical route, and it is the first button on the screen.
+
+**Gestdown.** A public proxy in front of Addic7ed — search, season listing and file
+download all verified working against the live service with no key, no account and
+no daily allowance. Its limit is catalogue, not access: Addic7ed indexes Western
+television thoroughly and anime barely.
+
+**OpenSubtitles.** The widest catalogue, including anime, and the only source that
+demands a key — a bare request returns `403 You cannot consume this service`, which
+no amount of client-side work changes. It stays switched off and greyed out until a
+key is supplied. A free key from opensubtitles.com enables it; the app never asks for
+a password.
+
+## Features
+
+**Mixed languages.** One batch can hold English and Hindi files together. Each file's
+language is detected separately and one model is loaded per language.
+
+**Read and edit.** Open any file to see source and translation side by side, search
+it, filter to the suspicious lines, and correct any line by hand.
+
+**Tools.** Shift timing by ±seconds (for rescuing subtitles cut for a different
+release), drop empty and repeated cues, detect language, and apply find-and-replace
+rules.
+
+**Export.** Individual files, a whole folder, or a ZIP that preserves the input's
+folder structure. Names can be kept unchanged so a player picks the subtitle up
+automatically, or written as bilingual files with the original line beneath each
+translation.
+
+Supported formats: `.srt` · `.vtt` · `.ass` / `.ssa`. In ASS files only the dialogue
+text changes — styles, fonts and positioning are left exactly as they were.
+
+## Speed
+
+Measured on a real 7-episode batch of 2,900 lines:
+
+| Approach | Model calls |
+|---|---|
+| One call per line | 2,900 |
+| Batching | 949 |
+| Batching + joined display lines | **297** |
+
+Three things do the work. Lines with no letters (`♪`, `...`) never go to the model.
+Identical lines are translated once. And several lines ride in one call — but **a
+batch is rejected outright unless the line count comes back exactly right**, and is
+then redone one line at a time. A slow correct answer beats a fast wrong one.
+
+Where a subtitle breaks across two display lines is a layout decision, not a meaning
+one, so the break is collapsed before translating. That cuts calls and hands the
+model a whole sentence instead of half of one.
+
+## Building
 
 ```bash
 ./gradlew :app:assembleDebug
 ./gradlew :app:testDebugUnitTest
 ```
 
-ডিভাইসে টেস্ট (ফোন USB দিয়ে যুক্ত থাকতে হবে):
+On-device tests (phone connected over USB):
 
 ```bash
 ./gradlew :app:connectedDebugAndroidTest
 ```
 
-ডিভাইস-টেস্ট আলাদা করে দরকার, কারণ অ্যান্ড্রয়েড আর ডেস্কটপ আলাদা রেগেক্স ইঞ্জিন ব্যবহার
-করে — ল্যাপটপে পাস করা প্যাটার্ন ফোনে ক্র্যাশ করতে পারে।
+The device suite is separate because Android and the desktop JVM use different regex
+engines, and because the only honest way to measure what a translation model does to
+a token is to ask a real one.
 
-## রিলিজ
+## Releases
 
-`v` দিয়ে শুরু ট্যাগ পুশ করলে GitHub Actions টেস্ট চালিয়ে APK বানিয়ে Releases পেজে তুলে দেয়।
+Pushing a tag beginning with `v` makes GitHub Actions run the tests, build the APK
+and publish it to the Releases page.
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-সাইনিং কী রিপোজিটরিতে থাকে না — লোকালি `keystore.properties`, CI-তে রিপোজিটরি সিক্রেট
-(`keystore.properties.example` দেখো)। কী না থাকলেও বিল্ড হয়, শুধু APK অস্বাক্ষরিত থাকে।
+Signing keys are not in the repository — `keystore.properties` locally, repository
+secrets in CI (see `keystore.properties.example`). The build works without them; the
+APK is simply unsigned.
 
-> কী হারালে ফোনে ইনস্টল করা অ্যাপ আর কোনোদিন আপডেট করা যাবে না — অ্যান্ড্রয়েড ভিন্ন
-> স্বাক্ষরের আপডেট নেয় না। `release.jks` ব্যাকআপ রাখো।
+> Lose the key and an installed app can never be updated again — Android refuses an
+> update signed differently. Back up `release.jks`.
 
-## API key
+## Keys
 
-**AI পলিশ ঐচ্ছিক** — বন্ধ রাখলে অ্যাপ পুরোপুরি অফলাইনে চলে। চালু করতে সেটিংসে একটা Gemini
-API key লাগে ([Google AI Studio](https://aistudio.google.com/apikey) থেকে ফ্রি)।
+**Everything works with no keys at all.** Both are optional and both are for extras:
 
-**OpenSubtitles** থেকে খুঁজতে ও নামাতে ওদের ফ্রি API key লাগে। দৈনিক ডাউনলোড সীমা ওদের
-সার্ভারের নিয়ম, অ্যাপ সেটা বদলাতে পারে না — পুরো সিজনের জন্য ZIP প্যাক ইমপোর্ট করাই
-বাস্তব পথ, ওতে কোনো সীমা নেই। অ্যাপ কখনো তোমার OpenSubtitles পাসওয়ার্ড চায় না।
+- **Gemini** — enables AI polish and glossary building. Without it the app runs
+  entirely offline. Free from [Google AI Studio](https://aistudio.google.com/apikey).
+- **OpenSubtitles** — enables that one source. The other two sources need nothing.
 
-সব key শুধু ফোনেই থাকে, সরাসরি সংশ্লিষ্ট সেবায় যায়, মাঝখানে কোনো সার্ভার নেই।
+Keys are stored on the device only and go straight to the service concerned. There is
+no server in between.
 
-## গঠন
+## Layout
 
 ```
 app/src/main/java/com/subtrans/app/
-  subtitle/   SRT · VTT · ASS পার্সার, এনকোডিং, টাইমিং শিফট, নামের লেবেল
-  engine/     গ্লসারি-লক, ভাষার গার্ড, ব্যাচিং, ML Kit, মান যাচাই
-  ai/         Gemini — গ্লসারি বানানো আর সন্দেহজনক লাইন ঠিক করা
-  net/        OpenSubtitles, ফোল্ডার স্ক্যান, ZIP ইমপোর্ট ও এক্সপোর্ট
-  data/       সেটিংস ও গ্লসারি সংরক্ষণ
-  ui/         Compose স্ক্রিন
-archive/web/  আগের ওয়েব প্রোটোটাইপ, পার্সারের লজিক এখান থেকে পোর্ট করা
+  subtitle/   SRT · VTT · ASS parsers, encoding, timing shift, name labels
+  engine/     markup splitting, glossary lock, language guard, batching,
+              ML Kit, phrase table, quality checks
+  ai/         Gemini — glossary building and repair of flagged lines
+  net/        subtitle sources, folder scan, ZIP import and export
+  data/       settings and glossary storage
+  ui/         Compose screens
+archive/web/  the earlier web prototype the parser logic was ported from
 ```
 
-## অবস্থা
+## Status
 
-১৩৯টা JVM ইউনিট টেস্ট পার্সার আর ইঞ্জিন ঢেকে রাখে, সাথে আলাদা একটা ডিভাইস-টেস্ট স্যুট।
-অ্যাপটা তৈরি ও বিল্ডযোগ্য, তবে সব ফিচার এখনো আসল ডিভাইসে পুরোপুরি যাচাই করা হয়নি।
+200 JVM unit tests cover the parsers and the engine, plus a separate device suite.
+Parsing is tested against responses captured from live services rather than invented
+ones, and the markup fix was swept across 2,474 real cues.
 
-## লাইসেন্স
+The app builds and the logic is verified, but ML Kit cannot run off a device, so
+**actual translation quality has been measured only on a phone, not in CI.** Treat
+the quality claims here as the result of reading real output, not as a benchmark.
 
-MIT — [LICENSE](LICENSE) দেখো।
+The interface is in Bengali.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
