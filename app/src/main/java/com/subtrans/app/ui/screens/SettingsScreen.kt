@@ -153,10 +153,13 @@ fun SettingsScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
 
         item {
             Column(Modifier.padding(top = 14.dp)) {
-                Text("OpenSubtitles", style = MaterialTheme.typography.titleSmall)
+                Text("OpenSubtitles (ঐচ্ছিক)", style = MaterialTheme.typography.titleSmall)
                 Text(
-                    "\"খোঁজো\" ট্যাবে সাবটাইটেল খুঁজতে ও নামাতে একটা ফ্রি API key লাগে — " +
-                        "opensubtitles.com-এ অ্যাকাউন্ট খুলে Consumers পাতা থেকে নেওয়া যায়।",
+                    "এটা ছাড়াও অ্যাপ পুরোপুরি চলে। \"খোঁজো\" ট্যাবে Gestdown উৎসটা " +
+                        "কোনো key ছাড়াই কাজ করে, আর ZIP ইমপোর্টে কিছুই লাগে না।\n\n" +
+                        "OpenSubtitles-এর ভাণ্ডার সবচেয়ে বড় — অ্যানিমেও আছে — কিন্তু তারা " +
+                        "key ছাড়া কোনো অনুরোধ নেয় না। চাইলে opensubtitles.com-এ ফ্রি " +
+                        "অ্যাকাউন্ট খুলে Consumers পাতা থেকে একটা নিয়ে এখানে বসাও।",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

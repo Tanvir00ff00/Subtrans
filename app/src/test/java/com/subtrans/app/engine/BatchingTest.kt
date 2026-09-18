@@ -82,9 +82,11 @@ class BatchingTest {
     }
 
     @Test
-    fun `flattening does not disturb ASS breaks, which are placeholders by then`() {
-        val prepared = Markup.protect("first\\Nsecond")
-        assertEquals(prepared.text, Batching.flatten(prepared.text))
+    fun `flattening does not disturb an ASS break`() {
+        // Markup.layout normally hands these out as separate chunks, so a `\N`
+        // should never reach flatten at all — but if one does, collapsing it
+        // would silently join two display lines.
+        assertEquals("first\\Nsecond", Batching.flatten("first\\Nsecond"))
     }
 
     @Test

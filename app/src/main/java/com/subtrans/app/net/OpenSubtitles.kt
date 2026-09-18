@@ -246,20 +246,3 @@ class OpenSubtitles(
     private fun encode(value: String): String =
         java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 }
-
-/**
- * Collapses many candidates per episode down to the single best one: trusted
- * uploads first, then whatever the most people have downloaded.
- */
-fun bestPerEpisode(entries: List<OpenSubtitles.Entry>): Map<Int, OpenSubtitles.Entry> {
-    val best = mutableMapOf<Int, OpenSubtitles.Entry>()
-    for (entry in entries) {
-        val episode = entry.episode ?: continue
-        val current = best[episode]
-        if (current == null || score(entry) > score(current)) best[episode] = entry
-    }
-    return best
-}
-
-private fun score(e: OpenSubtitles.Entry): Int =
-    (if (e.trusted) 1_000_000 else 0) + e.downloads - (if (e.hearingImpaired) 500 else 0)

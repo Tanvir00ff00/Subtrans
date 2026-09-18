@@ -632,6 +632,20 @@ private fun StatsCard(stats: RunStats) {
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(top = 2.dp),
             )
+            if (stats.repaired > 0 || stats.fromTable > 0) {
+                Text(
+                    buildString {
+                        if (stats.fromTable > 0) append("${stats.fromTable} টি লাইন শব্দতালিকা থেকে")
+                        if (stats.repaired > 0) {
+                            if (isNotEmpty()) append(" · ")
+                            append("${stats.repaired} টি আবার চেষ্টা করে ঠিক হয়েছে")
+                        }
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
         }
     }
 }

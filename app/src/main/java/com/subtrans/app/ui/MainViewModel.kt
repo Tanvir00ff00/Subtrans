@@ -19,7 +19,12 @@ import com.subtrans.app.engine.ReplaceRule
 import com.subtrans.app.engine.SourcePlan
 import com.subtrans.app.engine.TranslationEngine
 import com.subtrans.app.net.FolderScan
-import com.subtrans.app.net.OpenSubtitles
+import com.subtrans.app.net.Gestdown
+import com.subtrans.app.net.OpenSubtitlesSource
+import com.subtrans.app.net.SourceEntry
+import com.subtrans.app.net.SourceException
+import com.subtrans.app.net.SourceShow
+import com.subtrans.app.net.SubtitleSource
 import com.subtrans.app.net.ZipExport
 import com.subtrans.app.net.ZipImport
 import com.subtrans.app.net.bestPerEpisode
@@ -94,21 +99,27 @@ data class RunStats(
     val passedThrough: Int = 0,
     /** Which source languages the batch turned out to contain. */
     val languages: List<String> = emptyList(),
+    /** Lines a free offline retry rescued, costing no AI call. */
+    val repaired: Int = 0,
+    /** Lines answered from the built-in phrase table instead of the model. */
+    val fromTable: Int = 0,
 ) {
     /** Share of lines the offline engine handled without help. */
     val offlineShare: Double get() = if (lines == 0) 1.0 else 1.0 - flagged.toDouble() / lines
 }
 
 /** One episode as offered by a subtitle source, already narrowed to the best upload. */
-data class EpisodeOption(val episode: Int, val entry: OpenSubtitles.Entry)
+data class EpisodeOption(val episode: Int, val entry: SourceEntry)
 
 /** Everything the search tab is currently showing. */
 data class SearchState(
     val query: String = "",
     /** A short message while a request is in flight, or null when idle. */
     val busy: String? = null,
-    val shows: List<OpenSubtitles.Show> = emptyList(),
-    val show: OpenSubtitles.Show? = null,
+    /** Which source is being searched. Defaults to one that needs no key. */
+    val sourceId: String = "gestdown",
+    val shows: List<SourceShow> = emptyList(),
+    val show: SourceShow? = null,
     val season: Int = 1,
     val episodes: List<EpisodeOption> = emptyList(),
     val selected: Set<Int> = emptySet(),
@@ -398,6 +409,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 var statLines = 0
                 var statFlagged = 0
                 var statPolished = 0
+                var statRepaired = 0
+                var statFromTable = 0
                 var statFiles = 0
 
                 val glossary = activeGlossary
@@ -457,6 +470,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             statLines += report.total
                             statFlagged += report.flagged.size
                             statPolished += polished
+                            statRepaired += report.repaired
+                            statFromTable += report.fromTable
                         }
                     } finally {
                         engine.close()
@@ -472,6 +487,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         seconds = (System.currentTimeMillis() - startedAt) / 1000,
                         passedThrough = passedThrough,
                         languages = byLanguage.keys.toList(),
+                        repaired = statRepaired,
+                        fromTable = statFromTable,
                     )
                 }
 
@@ -618,42 +635,83 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _search = MutableStateFlow(SearchState())
     val search: StateFlow<SearchState> = _search.asStateFlow()
 
-    private fun openSubtitles(): OpenSubtitles? {
+    /**
+     * Every source the app knows, keyless ones first so the default costs the
+     * user nothing. A source that needs a key still appears — greyed out with
+     * an explanation — because hiding it would make the key look mandatory,
+     * which is the impression this list exists to remove.
+     */
+    fun sources(): List<SubtitleSource> {
         val s = settings.value
-        if (s.osApiKey.isBlank()) {
-            _search.value = _search.value.copy(
-                error = "সেটিংসে OpenSubtitles API key বসাও — ফ্রি অ্যাকাউন্টে পাওয়া যায়।",
-            )
-            return null
-        }
-        return OpenSubtitles(s.osApiKey, s.osToken)
+        return listOf(
+            Gestdown(),
+            OpenSubtitlesSource(s.osApiKey, s.osToken),
+        )
+    }
+
+    /** The chosen source, or the first usable one when that choice is not. */
+    private fun currentSource(): SubtitleSource {
+        val all = sources()
+        val picked = all.firstOrNull { it.id == _search.value.sourceId }
+        if (picked != null && picked.ready) return picked
+        return all.firstOrNull { it.ready } ?: all.first()
+    }
+
+    fun setSource(id: String) {
+        if (id == _search.value.sourceId) return
+        _search.value = SearchState(query = _search.value.query, sourceId = id)
     }
 
     fun setSearchQuery(q: String) { _search.value = _search.value.copy(query = q, error = null) }
 
     fun searchShows() = viewModelScope.launch {
-        val client = openSubtitles() ?: return@launch
+        val source = currentSource()
         val query = _search.value.query.trim()
         if (query.isBlank()) return@launch
 
+        if (!source.ready) {
+            _search.value = _search.value.copy(error = source.setupHint)
+            return@launch
+        }
+
         _search.value = _search.value.copy(busy = "সিরিজ খুঁজছি…", error = null, shows = emptyList())
         try {
-            val shows = client.searchShows(query)
+            val shows = source.searchShows(query)
             _search.value = _search.value.copy(
                 busy = null,
                 shows = shows,
                 show = null,
                 episodes = emptyList(),
                 selected = emptySet(),
-                error = if (shows.isEmpty()) "\"$query\" নামে কিছু পাওয়া গেল না।" else null,
+                // An empty result is usually the catalogue, not the spelling,
+                // so the message points at the thing the user can act on.
+                error = if (shows.isEmpty()) {
+                    "${source.label}-এ \"$query\" নেই। অন্য উৎস বেছে দেখো, " +
+                        "নয়তো ZIP বা ফোল্ডার হিসেবে ইমপোর্ট করো।"
+                } else null,
             )
         } catch (e: Exception) {
             _search.value = _search.value.copy(busy = null, error = e.message)
         }
     }
 
-    fun pickShow(show: OpenSubtitles.Show) {
-        _search.value = _search.value.copy(show = show, episodes = emptyList(), selected = emptySet())
+    fun pickShow(show: SourceShow) {
+        // Season 1 is not a safe default. Gestdown reports the seasons it
+        // actually holds, and for a long-running series that can be 3, 8 and
+        // 17 with nothing before them — asking for season 1 would show an
+        // empty list for a series that is perfectly well covered.
+        val season = when {
+            show.seasons.isEmpty() -> _search.value.season
+            _search.value.season in show.seasons -> _search.value.season
+            else -> show.seasons.first()
+        }
+
+        _search.value = _search.value.copy(
+            show = show,
+            season = season,
+            episodes = emptyList(),
+            selected = emptySet(),
+        )
         if (_series.value.isBlank()) _series.value = show.title
         loadEpisodes()
     }
@@ -668,18 +726,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadEpisodes() = viewModelScope.launch {
-        val client = openSubtitles() ?: return@launch
+        val source = currentSource()
         val state = _search.value
         val show = state.show ?: return@launch
 
         _search.value = state.copy(busy = "এপিসোড তালিকা আনছি…", error = null)
         try {
-            val entries = client.listSeason(
-                featureId = show.featureId,
+            val entries = source.listSeason(
+                show = show,
                 season = state.season,
-                language = settings.value.sourceTag,
+                languageTag = settings.value.sourceTag,
             ) { page, total ->
-                _search.value = _search.value.copy(busy = "এপিসোড তালিকা আনছি… ($page/$total)")
+                if (total > 1) {
+                    _search.value = _search.value.copy(busy = "এপিসোড তালিকা আনছি… ($page/$total)")
+                }
             }
 
             // Many uploads exist per episode; only the best one is worth showing.
@@ -691,7 +751,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 busy = null,
                 episodes = options,
                 selected = emptySet(),
-                remaining = client.remainingDownloads(),
+                remaining = source.remainingDownloads(),
                 error = if (options.isEmpty()) {
                     "সিজন ${state.season}-এ ${languageName(settings.value.sourceTag)} সাবটাইটেল পাওয়া গেল না।"
                 } else null,
@@ -724,7 +784,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * rather than hammering a limit that will not move until tomorrow.
      */
     fun downloadSelected() = viewModelScope.launch {
-        val client = openSubtitles() ?: return@launch
+        val source = currentSource()
         val state = _search.value
         val chosen = state.episodes.filter { it.episode in state.selected }
         if (chosen.isEmpty()) return@launch
@@ -739,13 +799,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 error = null,
             )
             try {
-                val ticket = client.requestDownload(option.entry.fileId)
-                remaining = ticket.remaining
-                val text = client.fetchText(ticket.link)
-                addContent(ticket.fileName, text)
+                val file = source.download(option.entry)
+                if (file.remaining != null) remaining = file.remaining
+                addContent(file.fileName, file.text)
                 done++
-            } catch (e: OpenSubtitles.ApiException) {
+            } catch (e: SourceException) {
                 stoppedBy = e.message
+                // A spent quota or a rejected key will not change on the next
+                // try, so the run stops instead of burning the whole list.
                 if (e.quotaExhausted || e.status == 403 || e.status == 401) break
             } catch (e: Exception) {
                 stoppedBy = e.message

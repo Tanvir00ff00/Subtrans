@@ -113,8 +113,8 @@ class BestPerEpisodeTest {
         trusted: Boolean = false,
         hearingImpaired: Boolean = false,
         fileId: Int = episode * 100 + downloads,
-    ) = OpenSubtitles.Entry(
-        fileId = fileId,
+    ) = SourceEntry(
+        id = fileId.toString(),
         fileName = "ep$episode.srt",
         release = "",
         season = 1,

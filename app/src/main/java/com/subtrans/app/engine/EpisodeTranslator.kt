@@ -1,6 +1,5 @@
 package com.subtrans.app.engine
 
-import com.subtrans.app.subtitle.Cue
 import com.subtrans.app.subtitle.Subtitle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -32,8 +31,8 @@ data class ReplaceRule(
 
 /**
  * A line the offline pass is not confident about, carried with everything a
- * later AI repair needs: the prepared source, the draft, and the placeholder
- * mapping to put styling and names back afterwards.
+ * later AI repair needs: the prepared source, the draft, and the token mapping
+ * to put locked names back afterwards.
  */
 data class FlaggedLine(
     val cueId: Int,
@@ -51,6 +50,12 @@ data class EpisodeReport(
     val skipped: Int = 0,
     /** Calls actually made, against [total]. Lower is faster. */
     val modelCalls: Int = 0,
+    /** Lines the offline retry rescued without spending an AI call. */
+    val repaired: Int = 0,
+    /** Lines where inline emphasis was dropped to keep the sentence whole. */
+    val stylingDropped: Int = 0,
+    /** Lines answered from [Lexicon] rather than by the model. */
+    val fromTable: Int = 0,
 ) {
     val flaggedShare: Double get() = if (total == 0) 0.0 else flagged.size.toDouble() / total
 }
@@ -62,6 +67,12 @@ data class EpisodeReport(
  * the per-call overhead — not the translation itself — is what makes a season
  * take hours. Lines that need nothing are dropped, identical lines are
  * translated once, and the rest ride several to a call. See [Batching].
+ *
+ * A cue is no longer one unit of translation. [Markup] cuts styling out of the
+ * line first, so a cue becomes one or more *chunks* of pure words; batching,
+ * de-duplication and retries all work on chunks, and the cue is reassembled at
+ * the end. Almost every real line yields exactly one chunk, so this costs
+ * nothing and buys the guarantee that no tag is ever shown to the model.
  */
 class EpisodeTranslator(
     private val engine: TranslationEngine,
@@ -71,6 +82,8 @@ class EpisodeTranslator(
     private val batchLines: Int = 8,
     /** Re-wrap translated lines at this width; 0 leaves them on one line. */
     private val wrapWidth: Int = 42,
+    /** Answer known short lines from [Lexicon] instead of asking the model. */
+    private val useLexicon: Boolean = true,
 ) {
 
     suspend fun translate(
@@ -83,92 +96,99 @@ class EpisodeTranslator(
 
         val prepared = sub.cues.map { TermPrep.prepare(it.text, glossary) }
 
-        // Where a cue wraps across two display lines carries no meaning, so the
-        // break is collapsed before translating. That lets the cue share a call
-        // with others and hands the model a whole sentence rather than half of
-        // one; the result is re-wrapped afterwards.
-        val forModel = prepared.map { Batching.flatten(it.text) }
+        // A cue is skipped whole when it is already written in the target
+        // language — translating Bengali as if it were English is the failure
+        // that LanguageGuard exists to stop.
+        val skipCue = sub.cues.map { LanguageGuard.alreadyInTarget(it.text, engine.targetTag) }
 
-        // Which cues actually have to reach the model.
-        val needsWork = sub.cues.indices.filter { i ->
-            !LanguageGuard.alreadyInTarget(sub.cues[i].text, engine.targetTag) &&
-                Batching.needsTranslation(forModel[i])
-        }
-
-        // Identical lines are translated once. Subtitles repeat themselves far
-        // more than they look like they do.
-        val uniqueTexts = mutableListOf<String>()
-        val indexOfText = mutableMapOf<String, Int>()
-        val cueToUnique = mutableMapOf<Int, Int>()
-        for (i in needsWork) {
-            val text = forModel[i]
-            val slot = indexOfText.getOrPut(text) {
-                uniqueTexts += text
-                uniqueTexts.size - 1
+        // Flatten every chunk into the one-line form the model sees. Where a
+        // cue wraps across two display lines is a layout decision, not a
+        // meaning one, and the model does better with a whole sentence.
+        val owner = mutableListOf<Int>()
+        val chunkText = mutableListOf<String>()
+        for (i in sub.cues.indices) {
+            for (chunk in prepared[i].chunks) {
+                owner += i
+                chunkText += Batching.flatten(chunk)
             }
-            cueToUnique[i] = slot
         }
 
-        val cuesPerUnique = IntArray(uniqueTexts.size)
-        for (slot in cueToUnique.values) cuesPerUnique[slot]++
+        val translatedChunk = arrayOfNulls<String>(chunkText.size)
 
-        val results = arrayOfNulls<String>(uniqueTexts.size)
+        // Lines the model is known to get wrong are answered from a table
+        // before it ever sees them. "Fine." is not a monetary penalty and
+        // "Bye-bye!" is not sleep, however confidently the model says so.
+        var fromTable = 0
+        if (useLexicon) {
+            for (k in chunkText.indices) {
+                if (skipCue[owner[k]]) continue
+                val known = Lexicon.lookup(chunkText[k], engine.targetTag) ?: continue
+                translatedChunk[k] = known
+                fromTable++
+            }
+        }
+
+        val needsWork = chunkText.indices.filter { k ->
+            !skipCue[owner[k]] &&
+                translatedChunk[k] == null &&
+                Batching.needsTranslation(chunkText[k])
+        }
         val calls = AtomicInteger(0)
-        val done = AtomicInteger(total - needsWork.size)
-        onProgress(done.get(), total)
-
-        val plan = Batching.plan(uniqueTexts, maxLines = batchLines)
         val gate = Semaphore(concurrency.coerceIn(1, 16))
 
-        coroutineScope {
-            plan.batches.map { batch ->
-                async {
-                    gate.withPermit { runBatch(batch, uniqueTexts, results, calls) }
-                    var advanced = 0
-                    for (slot in batch) advanced += cuesPerUnique[slot]
-                    onProgress(done.addAndGet(advanced), total)
-                }
-            }.awaitAll()
+        runPass(needsWork, chunkText, translatedChunk, calls, gate) { done ->
+            onProgress(progressOf(done, needsWork.size, total), total)
         }
 
-        // Stitch everything back onto the cues and judge the result.
+        // Stitch, judge, and give anything suspicious one free offline retry
+        // with the locked names written out in full. A model that choked on a
+        // token usually does not choke on the plain sentence, and an
+        // inconsistent name beats an English line in a Bengali file.
+        val stitched = sub.cues.indices.map { i ->
+            stitch(i, sub, prepared[i], skipCue[i], owner, chunkText, translatedChunk)
+        }
+
+        val retryable = stitched.withIndex()
+            .filter { (_, r) -> r != null && QualityCheck.worthRetrying(r.verdict.flags) }
+            .map { it.index }
+
+        val repaired: Map<Int, String> =
+            if (retryable.isEmpty()) emptyMap() else retry(retryable, prepared, stitched, calls, gate)
+
         val flagged = mutableListOf<FlaggedLine>()
         val counts = mutableMapOf<QualityCheck.Flag, Int>()
+        var skippedLines = 0
+        var stylingDropped = 0
 
         for (i in sub.cues.indices) {
             val cue = sub.cues[i]
-            val slot = cueToUnique[i]
-            if (slot == null) {
-                // Nothing to do: already in the target language, or letterless.
+            val result = stitched[i]
+            if (prepared[i].stylingDropped) stylingDropped++
+
+            if (result == null) {
                 cue.translated = null
+                skippedLines++
                 continue
             }
 
-            val draft = results[slot]
-            if (draft == null) {
-                cue.translated = null
+            // A line the retry rescued is finished: it must not be overwritten
+            // by the draft it replaced, and it must not be sent to the AI.
+            val rescued = repaired[i]
+            if (rescued != null) {
+                cue.translated = Batching.rewrap(rescued, wrapWidth)
+                continue
+            }
+
+            cue.translated = Batching.rewrap(result.text, wrapWidth)
+            if (result.verdict.flags.isNotEmpty()) {
                 flagged += FlaggedLine(
-                    cue.id, forModel[i], forModel[i], prepared[i],
-                    setOf(QualityCheck.Flag.UNCHANGED),
+                    cueId = cue.id,
+                    preparedSource = result.source,
+                    draft = result.draft,
+                    prepared = prepared[i],
+                    flags = result.verdict.flags,
                 )
-                counts[QualityCheck.Flag.UNCHANGED] =
-                    (counts[QualityCheck.Flag.UNCHANGED] ?: 0) + 1
-                continue
-            }
-
-            val finished = TermPrep.finish(draft, prepared[i])
-            val ruled = rules.fold(finished.text) { acc, rule -> rule.apply(acc) }
-            cue.translated = Batching.rewrap(ruled, wrapWidth)
-
-            val verdict = QualityCheck.inspect(
-                source = forModel[i],
-                output = draft,
-                targetTag = engine.targetTag,
-                lostPlaceholders = finished.lost,
-            )
-            if (verdict.flags.isNotEmpty()) {
-                flagged += FlaggedLine(cue.id, forModel[i], draft, prepared[i], verdict.flags)
-                for (flag in verdict.flags) counts[flag] = (counts[flag] ?: 0) + 1
+                for (flag in result.verdict.flags) counts[flag] = (counts[flag] ?: 0) + 1
             }
         }
 
@@ -177,9 +197,161 @@ class EpisodeTranslator(
             total = total,
             flagged = flagged,
             flagCounts = counts,
-            skipped = total - needsWork.size,
+            skipped = skippedLines,
             modelCalls = calls.get(),
+            repaired = repaired.size,
+            stylingDropped = stylingDropped,
+            fromTable = fromTable,
         )
+    }
+
+    private fun progressOf(doneChunks: Int, totalChunks: Int, totalCues: Int): Int {
+        if (totalChunks == 0) return totalCues
+        return (doneChunks.toLong() * totalCues / totalChunks).toInt().coerceIn(0, totalCues)
+    }
+
+    /** Translates a set of chunks, de-duplicated and batched. */
+    private suspend fun runPass(
+        indices: List<Int>,
+        texts: List<String>,
+        into: Array<String?>,
+        calls: AtomicInteger,
+        gate: Semaphore,
+        onProgress: (done: Int) -> Unit,
+    ) {
+        if (indices.isEmpty()) return
+
+        // Identical lines are translated once. Subtitles repeat themselves far
+        // more than they look like they do.
+        val unique = mutableListOf<String>()
+        val slotOfText = mutableMapOf<String, Int>()
+        val slotOf = mutableMapOf<Int, Int>()
+        for (k in indices) {
+            val slot = slotOfText.getOrPut(texts[k]) {
+                unique += texts[k]
+                unique.size - 1
+            }
+            slotOf[k] = slot
+        }
+
+        val usesPerSlot = IntArray(unique.size)
+        for (slot in slotOf.values) usesPerSlot[slot]++
+
+        val results = arrayOfNulls<String>(unique.size)
+        val plan = Batching.plan(unique, maxLines = batchLines)
+        val done = AtomicInteger(0)
+
+        coroutineScope {
+            plan.batches.map { batch ->
+                async {
+                    gate.withPermit { runBatch(batch, unique, results, calls) }
+                    var advanced = 0
+                    for (slot in batch) advanced += usesPerSlot[slot]
+                    onProgress(done.addAndGet(advanced))
+                }
+            }.awaitAll()
+        }
+
+        for (k in indices) into[k] = results[slotOf.getValue(k)]
+    }
+
+    private data class Stitched(
+        val text: String,
+        val source: String,
+        val draft: String,
+        val verdict: QualityCheck.Verdict,
+    )
+
+    /** Rebuilds one cue from its translated chunks and judges the result. */
+    private fun stitch(
+        cue: Int,
+        sub: Subtitle,
+        prepared: TermPrep.Prepared,
+        skipped: Boolean,
+        owner: List<Int>,
+        chunkText: List<String>,
+        translated: Array<String?>,
+    ): Stitched? {
+        if (skipped) return null
+
+        val slots = owner.indices.filter { owner[it] == cue }
+        if (slots.isEmpty()) return null
+        // A cue whose every chunk was letterless had nothing to translate.
+        if (slots.none { translated[it] != null }) return null
+
+        val drafts = slots.map { translated[it] ?: chunkText[it] }
+        val sources = slots.map { chunkText[it] }
+
+        val finished = TermPrep.finish(drafts, prepared)
+        val ruled = rules.fold(finished.text) { acc, rule -> rule.apply(acc) }
+
+        val verdict = QualityCheck.inspect(
+            source = sources.joinToString(" "),
+            output = drafts.joinToString(" "),
+            targetTag = engine.targetTag,
+            lostPlaceholders = finished.lost,
+        )
+        return Stitched(ruled, sources.joinToString(" "), drafts.joinToString(" "), verdict)
+    }
+
+    /**
+     * One more offline attempt at the lines that came back wrong. Two things
+     * change on the second try, and either can be the thing that was breaking
+     * it:
+     *
+     *  - **The line goes over alone.** Most lines ride to the model eight to a
+     *    call, and a neighbour can drag a translation off course or come back
+     *    merged. On its own, a line has nothing to be confused by.
+     *  - **Locked names are written out in full.** If a token is what the model
+     *    choked on, there is no token left to choke on. The name may then be
+     *    spelled inconsistently, which is a real cost — but a readable line
+     *    with an odd spelling beats an English line in a Bengali file.
+     *
+     * Only lines already judged broken get this, so it costs a handful of
+     * calls, and the result is kept only when it is measurably less broken.
+     * Returns the cue indices it rescued, with their finished text.
+     */
+    private suspend fun retry(
+        cues: List<Int>,
+        prepared: List<TermPrep.Prepared>,
+        stitched: List<Stitched?>,
+        calls: AtomicInteger,
+        gate: Semaphore,
+    ): Map<Int, String> = coroutineScope {
+        cues.map { i ->
+            async {
+                val before = stitched[i]?.verdict?.flags ?: return@async null
+                val plain = prepared[i].plainChunks().map { Batching.flatten(it) }
+                if (plain.none { Batching.needsTranslation(it) }) return@async null
+
+                val out = plain.map { chunk ->
+                    if (!Batching.needsTranslation(chunk)) chunk else {
+                        gate.withPermit {
+                            runCatching {
+                                calls.incrementAndGet()
+                                engine.translate(chunk)
+                            }.getOrNull()
+                        } ?: return@async null
+                    }
+                }
+
+                val verdict = QualityCheck.inspect(
+                    source = plain.joinToString(" "),
+                    output = out.joinToString(" "),
+                    targetTag = engine.targetTag,
+                    lostPlaceholders = 0,
+                )
+                if (!QualityCheck.isBetter(verdict.flags, before)) return@async null
+
+                // The retry carried no tokens, so nothing needs restoring —
+                // only the markup goes back around it.
+                val layout = Markup.Layout(prepared[i].slots, plain, prepared[i].stylingDropped)
+                val text = rules.fold(Markup.assemble(layout, out).trim()) { acc, rule ->
+                    rule.apply(acc)
+                }
+                i to text
+            }
+        }.awaitAll().filterNotNull().toMap()
     }
 
     /**
@@ -219,8 +391,8 @@ class EpisodeTranslator(
 
     /**
      * Writes AI repairs back into the episode. Corrections still arrive with
-     * placeholders in them, so they go through the same restore path as the
-     * offline output — styling and locked names cannot be lost here either.
+     * tokens in them, so they go through the same restore path as the offline
+     * output — locked names cannot be lost here either.
      */
     fun applyPolish(
         sub: Subtitle,
@@ -234,7 +406,7 @@ class EpisodeTranslator(
         for (line in flagged) {
             val corrected = corrections[line.cueId] ?: continue
             val cue = byId[line.cueId] ?: continue
-            val finished = TermPrep.finish(corrected, line.prepared)
+            val finished = TermPrep.finishWhole(corrected, line.prepared)
             if (finished.text.isBlank()) continue
             val ruled = rules.fold(finished.text) { acc, rule -> rule.apply(acc) }
             cue.translated = Batching.rewrap(ruled, wrapWidth)

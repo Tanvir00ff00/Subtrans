@@ -29,17 +29,54 @@ object QualityCheck {
 
         /** The same word repeats over and over — classic model degeneration. */
         REPETITION,
+
+        /** Token or tag wreckage survived into the finished line. */
+        TOKEN_DEBRIS,
     }
 
     data class Verdict(val flags: Set<Flag>) {
         val suspicious: Boolean get() = flags.isNotEmpty()
     }
 
+    /**
+     * Failures a second offline attempt can plausibly fix, because they are
+     * caused by what was *sent* rather than by the sentence being hard: a
+     * token the model tripped over, a line it echoed back untranslated, or a
+     * degenerate loop. A length anomaly, by contrast, usually means the
+     * translation is simply short, and retrying it changes nothing.
+     */
+    private val RETRYABLE = setOf(
+        Flag.LOST_PLACEHOLDER, Flag.UNCHANGED, Flag.UNTRANSLATED_RUN,
+        Flag.REPETITION, Flag.TOKEN_DEBRIS,
+    )
+
+    fun worthRetrying(flags: Set<Flag>): Boolean = flags.any { it in RETRYABLE }
+
+    /**
+     * Whether a retry is an improvement worth keeping. Only the serious flags
+     * count: trading a length anomaly for a clean translation is a win, and
+     * trading nothing for nothing is not worth the churn.
+     */
+    fun isBetter(after: Set<Flag>, before: Set<Flag>): Boolean {
+        val a = after.count { it in RETRYABLE }
+        val b = before.count { it in RETRYABLE }
+        return a < b
+    }
+
     private val LATIN_RUN = Regex("""[A-Za-z]{3,}""")
     private val WORD = Regex("""\S+""")
-    private val PLACEHOLDER_ANY = Regex(
-        Regex.escape(Markup.PLACEHOLDER_PREFIX) + """\d+""" + Regex.escape(Markup.PLACEHOLDER_SUFFIX)
-    )
+
+    // Tolerant on purpose: a model that pads a token with spaces still left a
+    // token behind, and the judgement here must see it. This is the check that
+    // `@ 0 @` slipped past for six whole episodes.
+    private val TOKEN_ANY = Regex("""[Xx]\s*[Qq]\s*\d+\s*[Qq]""")
+
+    /**
+     * Debris from an older token shape, or from a model that shredded one.
+     * Runs of `@`, stray `<`/`>`, and lone `{`/`}` have no business in a
+     * finished subtitle line.
+     */
+    private val DEBRIS = Regex("""@\s*\d*\s*@|[{}]|<(?!/?[A-Za-z])""")
 
     /**
      * Language tags whose writing system is Latin. For any other target, Latin
@@ -60,6 +97,7 @@ object QualityCheck {
         val flags = mutableSetOf<Flag>()
 
         if (lostPlaceholders > 0) flags += Flag.LOST_PLACEHOLDER
+        if (DEBRIS.containsMatchIn(output)) flags += Flag.TOKEN_DEBRIS
 
         val bareSource = strip(source)
         val bareOutput = strip(output)
@@ -93,9 +131,9 @@ object QualityCheck {
         return Verdict(flags)
     }
 
-    /** Placeholders and whitespace are noise for every judgement here. */
+    /** Tokens and whitespace are noise for every judgement here. */
     private fun strip(text: String): String =
-        PLACEHOLDER_ANY.replace(text, " ").replace(Regex("""\s+"""), " ").trim()
+        TOKEN_ANY.replace(text, " ").replace(Regex("""\s+"""), " ").trim()
 
     /**
      * Three or more identical words in a row. Two is ordinary emphasis

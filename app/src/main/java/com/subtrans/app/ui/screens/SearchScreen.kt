@@ -23,6 +23,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -42,13 +43,17 @@ import com.subtrans.app.ui.MainViewModel
 import com.subtrans.app.ui.languageName
 
 /**
- * Finding subtitles without leaving the app.
+ * Finding subtitles without leaving the app, and without signing up for
+ * anything.
  *
- * Two routes sit side by side on purpose. Searching OpenSubtitles is the
- * convenient one, but every episode spends one of a small daily allowance, so
- * the remaining count is shown before a bulk download rather than after.
- * Importing a season pack as a ZIP costs nothing at all, which is the only
- * practical way to get a long series in one go.
+ * Three routes sit side by side, cheapest first. A ZIP season pack costs
+ * nothing and has no limit, which is still the only practical way to get three
+ * hundred episodes in one go. Gestdown searches Addic7ed with no key and no
+ * allowance, but its catalogue is thin on anime. OpenSubtitles has the widest
+ * catalogue and is the only one that demands a key, so it sits last and stays
+ * switched off until the user decides it is worth the trouble.
+ *
+ * The daily-allowance counter is only shown by the source that has one.
  */
 @Composable
 fun SearchScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
@@ -75,11 +80,40 @@ fun SearchScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
 
         item {
             Text(
-                "একটা ZIP-এ গোটা সিজন থাকলে সেটা এক ডাউনলোডেই আসে — দৈনিক সীমার হিসাবে পড়ে না। " +
-                    "নিচের সার্চে প্রতিটা এপিসোড আলাদা করে নামে, তাই সীমা লাগে।",
+                "একটা ZIP-এ গোটা সিজন থাকলে সেটা এক ধাপেই আসে, কোনো সীমা ছাড়াই। " +
+                    "লম্বা সিরিজের জন্য এটাই সবচেয়ে নিশ্চিত পথ।",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        // Which service to search. Keyless ones come first, and the one that
+        // needs a key is shown greyed out rather than hidden — hiding it would
+        // make a key look compulsory, which is exactly the wrong impression.
+        if (state.show == null) {
+            item {
+                val sources = vm.sources()
+                Column {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        for (source in sources) {
+                            FilterChip(
+                                selected = source.id == state.sourceId,
+                                onClick = { vm.setSource(source.id) },
+                                enabled = source.ready,
+                                label = { Text(source.label) },
+                            )
+                        }
+                    }
+                    val chosen = sources.firstOrNull { it.id == state.sourceId }
+                        ?: sources.first()
+                    Text(
+                        chosen.setupHint ?: chosen.note,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
         }
 
         if (state.show == null) {
@@ -214,7 +248,7 @@ fun SearchScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         }
 
         if (state.show == null) {
-            items(state.shows, key = { it.featureId }) { show ->
+            items(state.shows, key = { it.id }) { show ->
                 Card(
                     colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceVariant),
                     modifier = Modifier.fillMaxWidth().clickable { vm.pickShow(show) },
@@ -224,7 +258,16 @@ fun SearchScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                         Text(
                             listOfNotNull(
                                 show.year,
-                                show.seasons?.let { "$it সিজন" },
+                                show.seasons.takeIf { it.isNotEmpty() }?.let { seasons ->
+                                    // Which seasons, not how many: a source
+                                    // that holds 3, 8 and 17 must not look
+                                    // like it holds 1 to 3.
+                                    if (seasons.size <= 4) {
+                                        "সিজন " + seasons.joinToString(", ")
+                                    } else {
+                                        "${seasons.size} সিজন (${seasons.first()}–${seasons.last()})"
+                                    }
+                                },
                             ).joinToString(" · "),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

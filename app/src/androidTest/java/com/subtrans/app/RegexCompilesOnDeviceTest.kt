@@ -35,18 +35,25 @@ class RegexCompilesOnDeviceTest {
 
     @Test
     fun markupPatternsCompile() {
-        val prepared = Markup.protect("""{\an8}<i>Hello</i>\Nthere""")
-        assertEquals(4, prepared.tokens.size)
-        assertEquals("""{\an8}<i>Hello</i>\Nthere""", Markup.restore(prepared.text, prepared.tokens))
-        assertTrue(Markup.scrub(prepared.text).isNotEmpty())
-        assertTrue(Markup.intact(prepared.text, prepared.tokens))
+        val layout = Markup.layout("""{\an8}<i>Hello</i>\Nthere""")
+        assertEquals(listOf("Hello", "there"), layout.chunks)
+        assertEquals("""{\an8}<i>Hello</i>\Nthere""", Markup.assemble(layout, layout.chunks))
+    }
+
+    @Test
+    fun tokenPatternsCompile() {
+        // The tolerant form matters most on a device: this is where the model
+        // that pads tokens with spaces actually lives.
+        assertEquals("নারুতো!", Markup.restore("Xq 0 q!", listOf("নারুতো")))
+        assertEquals(1, Markup.survivors("Xq0q", listOf("নারুতো")))
+        assertTrue(Markup.scrub("Xq0q here").isNotEmpty())
     }
 
     @Test
     fun termPrepPatternsCompile() {
         val glossary = listOf(GlossaryEntry("Naruto", "নারুতো"))
         val prepared = TermPrep.prepare("""{\an8}Naruto is late""", glossary)
-        val finished = TermPrep.finish(prepared.text, prepared)
+        val finished = TermPrep.finish(prepared.chunks, prepared)
         assertEquals("""{\an8}নারুতো is late""", finished.text)
         assertEquals(0, finished.lost)
     }

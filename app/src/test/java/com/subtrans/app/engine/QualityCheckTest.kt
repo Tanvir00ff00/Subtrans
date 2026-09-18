@@ -43,14 +43,49 @@ class QualityCheckTest {
     }
 
     @Test
-    fun `placeholders do not count as untranslated latin`() {
-        // A line that is only a locked name plus a tag must stay clean.
+    fun `tokens do not count as untranslated latin`() {
+        // A line that is only a locked name must stay clean. The tag never
+        // reaches the model at all, so it cannot be judged here either.
         val prepared = TermPrep.prepare(
             "<i>Rasengan</i>",
             listOf(GlossaryEntry("Rasengan", "রাসেনগান")),
         )
-        val v = QualityCheck.inspect(prepared.text, prepared.text, "bn", 0)
+        val chunk = prepared.chunks.single()
+        val v = QualityCheck.inspect(chunk, chunk, "bn", 0)
         assertFalse(v.suspicious)
+    }
+
+    /**
+     * The wreckage the old `@0@` token left behind on real episodes: spaced
+     * tokens and bare `@` runs written straight into a finished subtitle. If
+     * anything like it ever reaches the output again, this has to notice.
+     */
+    @Test
+    fun `token wreckage in the output is flagged`() {
+        val v = QualityCheck.inspect("The only saving grace", "@ 0 @ একমাত্র সংরক্ষণ @ 1 @", "bn", 0)
+        assertTrue(v.flags.contains(Flag.TOKEN_DEBRIS))
+    }
+
+    @Test
+    fun `ordinary bengali output carries no debris flag`() {
+        val v = QualityCheck.inspect("The only saving grace", "একমাত্র সান্ত্বনা", "bn", 0)
+        assertFalse(v.flags.contains(Flag.TOKEN_DEBRIS))
+    }
+
+    @Test
+    fun `a line worth retrying is told apart from one that is not`() {
+        assertTrue(QualityCheck.worthRetrying(setOf(Flag.UNTRANSLATED_RUN)))
+        assertTrue(QualityCheck.worthRetrying(setOf(Flag.TOKEN_DEBRIS)))
+        // Short output is usually just short; retrying changes nothing.
+        assertFalse(QualityCheck.worthRetrying(setOf(Flag.LENGTH_ANOMALY)))
+    }
+
+    @Test
+    fun `a retry is kept only when it drops a serious flag`() {
+        assertTrue(QualityCheck.isBetter(emptySet(), setOf(Flag.UNTRANSLATED_RUN)))
+        assertFalse(QualityCheck.isBetter(setOf(Flag.UNTRANSLATED_RUN), setOf(Flag.UNTRANSLATED_RUN)))
+        // Trading a length anomaly for a clean translation still counts as a win.
+        assertTrue(QualityCheck.isBetter(setOf(Flag.LENGTH_ANOMALY), setOf(Flag.REPETITION)))
     }
 
     @Test
