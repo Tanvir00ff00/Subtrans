@@ -1,0 +1,21 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+keystore.properties
+*.jks
+*.keystore
+
+# The archived web prototype keeps its own build output out of the repo.
+archive/web/node_modules/
+archive/web/dist/
+
+# Kotlin incremental-compilation session data
+.kotlin/

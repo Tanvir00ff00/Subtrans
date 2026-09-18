@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  An original mark: a screen frame with two caption bars inside it, the lower
+  one shortened the way a second subtitle line usually is. Drawn inside the
+  safe zone of the 108dp adaptive-icon canvas.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,34 L78,34 A6,6 0 0 1 84,40 L84,68 A6,6 0 0 1 78,74 L30,74 A6,6 0 0 1 24,68 L24,40 A6,6 0 0 1 30,34 Z M30,40 L30,68 L78,68 L78,40 Z" />
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M33,48 L69,48 A2.5,2.5 0 0 1 69,53 L33,53 A2.5,2.5 0 0 1 33,48 Z" />
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M33,58 L57,58 A2.5,2.5 0 0 1 57,63 L33,63 A2.5,2.5 0 0 1 33,58 Z" />
+</vector>
