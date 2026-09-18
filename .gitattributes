@@ -1,0 +1,13 @@
+# Normalise to LF in the repository. Without this, Windows checkouts commit
+# CRLF and the Ubuntu CI runner refuses to execute gradlew ("bad interpreter").
+* text=auto eol=lf
+
+# Windows-only scripts keep their native endings.
+*.bat text eol=crlf
+
+# Never touch binaries.
+*.jar binary
+*.jks binary
+*.keystore binary
+*.png binary
+*.webp binary
